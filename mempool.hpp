@@ -135,12 +135,6 @@ struct LargeBlockHeader {
   bool validate() const { return magic == MAGIC_NUMBER; }
 };
 
-struct alignas(CACHE_LINE_SIZE) ChunkHeader {
-  ChunkHeader *next;
-  size_t size;
-  size_t used;
-};
-
 struct FreeList {
   std::atomic<BlockHeader *> head{nullptr};
 
@@ -165,7 +159,12 @@ struct FreeList {
   }
 };
 
-class BlockPool {
+struct alignas(CACHE_LINE_SIZE) ChunkHeader {
+  size_t size;
+  size_t used;
+};
+
+class alignas(CACHE_LINE_SIZE) BlockPool {
   size_t block_size_;
   size_t blocks_per_chunk_;
   std::vector<ChunkHeader *> chunks_;
@@ -182,31 +181,14 @@ public:
 
   ~BlockPool() { clear(); }
 
-  void *allocate() {
+  BlockHeader *allocate_header() {
     BlockHeader *h = free_list_.pop();
-    if (!h) {
+    if (!h)
       h = allocate_chunk();
-      if (!h)
-        return nullptr;
-    }
-    h->ref_count.store(1, std::memory_order_relaxed);
-    return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
+    return h;
   }
 
-  void deallocate(void *ptr) {
-    if (!ptr)
-      return;
-    auto *h = reinterpret_cast<BlockHeader *>(reinterpret_cast<uint8_t *>(ptr) -
-                                              sizeof(BlockHeader));
-
-    if (!h->validate())
-      return;
-
-    if (h->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      std::memset(ptr, 0xCC, block_size_);
-      free_list_.push(h);
-    }
-  }
+  void return_header(BlockHeader *h) { free_list_.push(h); }
 
   void clear() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -248,6 +230,15 @@ private:
   }
 };
 
+// ChunkHeader is cache-line aligned to avoid false sharing
+// during global refill/drain paths (cold but contended).
+struct ThreadCache {
+  static constexpr size_t REFILL_BATCH = 32;
+  FreeList local[MAX_POOL_COUNT];
+};
+
+thread_local ThreadCache tls_cache;
+
 class MemAllocator {
   struct PoolEntry {
     std::unique_ptr<BlockPool> pool;
@@ -268,8 +259,24 @@ public:
   }
 
   void *allocate(size_t size, size_t align) {
-    if (size <= MAX_FIXED_SIZE)
-      return alloc_small(size);
+    if (size <= MAX_FIXED_SIZE) {
+      size_t id = get_pool_id(size);
+
+      if (auto *h = tls_cache.local[id].pop()) {
+        h->ref_count.store(1, std::memory_order_relaxed);
+        return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
+      }
+
+      refill_tls(id);
+
+      if (auto *h = tls_cache.local[id].pop()) {
+        h->ref_count.store(1, std::memory_order_relaxed);
+        return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
+      }
+
+      return nullptr;
+    }
+
     return alloc_large(size, align);
   }
 
@@ -281,10 +288,12 @@ public:
                                               sizeof(BlockHeader));
 
     if (h->validate() && !h->meta.is_large) {
-      pools_[h->meta.pool_id].pool->deallocate(ptr);
-    } else {
-      free_large(ptr);
+      size_t id = h->meta.pool_id;
+      tls_cache.local[id].push(h);
+      return;
     }
+
+    free_large(ptr);
   }
 
 private:
@@ -292,22 +301,19 @@ private:
     pools_.resize(MAX_POOL_COUNT);
   }
 
-  void *alloc_small(size_t size) {
-    size_t id = get_pool_id(size);
-    size_t actual = get_pool_size(id);
-
+  void refill_tls(size_t id) {
     auto &e = pools_[id];
-    if (!e.pool)
-      e.pool = std::make_unique<BlockPool>(actual);
+    if (!e.pool) {
+      e.pool = std::make_unique<BlockPool>(get_pool_size(id));
+    }
 
-    void *p = e.pool->allocate();
-    auto *h = reinterpret_cast<BlockHeader *>(reinterpret_cast<uint8_t *>(p) -
-                                              sizeof(BlockHeader));
-
-    h->meta.size = actual;
-    h->meta.pool_id = id;
-    h->meta.is_large = 0;
-    return p;
+    for (size_t i = 0; i < ThreadCache::REFILL_BATCH; ++i) {
+      if (auto *h = e.pool->allocate_header()) {
+        tls_cache.local[id].push(h);
+      } else {
+        break;
+      }
+    }
   }
 
   void *alloc_large(size_t size, size_t align) {
@@ -366,14 +372,5 @@ inline void *allocate(size_t size, size_t align = ALIGN_SIZE) {
 inline void deallocate(void *ptr) {
   details::MemAllocator::instance().deallocate(ptr);
 }
-
-template <typename T> class Allocator {
-public:
-  using value_type = T;
-  T *allocate(size_t n) {
-    return static_cast<T *>(mempool::allocate(n * sizeof(T), alignof(T)));
-  }
-  void deallocate(T *p, size_t) { mempool::deallocate(p); }
-};
 
 } // namespace mempool
