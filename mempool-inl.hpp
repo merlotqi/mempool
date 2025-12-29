@@ -11,7 +11,9 @@
 #error "Unsupported platform"
 #endif
 
+#include <array>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -34,8 +36,6 @@ static constexpr size_t MAX_POOL_COUNT = 32;
 static constexpr size_t LARGE_ALLOC_THRESHOLD = 1024 * 1024;
 static constexpr size_t DEFAULT_CHUNK_SIZE = 64 * 1024;
 static constexpr uint32_t MAGIC_NUMBER = 0xDEADBEEF;
-
-namespace details {
 
 #if defined(_WIN32)
 
@@ -84,17 +84,62 @@ inline void platform_free_aligned(void *ptr) { free(ptr); }
 
 inline size_t align_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
+static constexpr size_t SIZE_CLASSES[] = {
+    16,   24,   32,   48,   64,   80,   96,   112,  128, 160,
+    192,  224,  256,  320,  384,  448,  512,  640,  768, 896,
+    1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096};
+
+static constexpr size_t NUM_SIZE_CLASSES =
+    sizeof(SIZE_CLASSES) / sizeof(SIZE_CLASSES[0]);
+
 inline size_t get_pool_id(size_t sz) {
-  size_t id = 0;
-  size_t s = MIN_BLOCK_SIZE;
-  while (s < sz && id < MAX_POOL_COUNT - 1) {
-    s <<= 1;
-    ++id;
+  static constexpr size_t LARGE_POOL_ID = NUM_SIZE_CLASSES;
+  static constexpr size_t ALIGN_SHIFT = 3;
+  static constexpr size_t LOOKUP_TABLE_SIZE =
+      (MAX_FIXED_SIZE >> ALIGN_SHIFT) + 1;
+  static constexpr size_t ALIGN_SIZE = 1u << ALIGN_SHIFT;
+
+  static_assert(
+      [] {
+        for (size_t sz : SIZE_CLASSES) {
+          if (sz % ALIGN_SIZE != 0)
+            return false;
+        }
+        return true;
+      }(),
+      "All entries in SIZE_CLASSES must be a multiple of ALIGN_SIZE (8)!");
+
+  if (sz == 0) [[unlikely]] {
+    sz = 1;
   }
-  return id;
+
+  static constexpr auto create_lookup_table = []() constexpr {
+    std::array<uint8_t, LOOKUP_TABLE_SIZE> table{};
+    size_t class_idx = 0;
+    for (size_t i = 0; i < LOOKUP_TABLE_SIZE; ++i) {
+      size_t actual_size = i << ALIGN_SHIFT;
+      while (class_idx + 1 < NUM_SIZE_CLASSES &&
+             actual_size > SIZE_CLASSES[class_idx]) {
+        ++class_idx;
+      }
+      table[i] = static_cast<uint8_t>(class_idx);
+    }
+    return table;
+  };
+
+  static constexpr auto LOOKUP_TABLE = create_lookup_table();
+
+  if (sz > 4096) [[unlikely]] {
+    return LARGE_POOL_ID;
+  }
+
+  return LOOKUP_TABLE[(sz + 7) >> ALIGN_SHIFT];
 }
 
-inline size_t get_pool_size(size_t id) { return MIN_BLOCK_SIZE << id; }
+inline size_t get_pool_size(size_t id) {
+  assert(id < NUM_SIZE_CLASSES);
+  return SIZE_CLASSES[id];
+}
 
 struct BlockHeader {
   union {
@@ -362,15 +407,5 @@ private:
       platform_free_aligned(h->base);
   }
 };
-
-} // namespace details
-
-inline void *allocate(size_t size, size_t align = ALIGN_SIZE) {
-  return details::MemAllocator::instance().allocate(size, align);
-}
-
-inline void deallocate(void *ptr) {
-  details::MemAllocator::instance().deallocate(ptr);
-}
 
 } // namespace mempool
