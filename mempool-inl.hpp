@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <malloc.h>
 #elif defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #else
@@ -280,9 +281,42 @@ private:
 struct ThreadCache {
   static constexpr size_t REFILL_BATCH = 32;
   FreeList local[MAX_POOL_COUNT];
+
+  std::atomic<bool> drained{false};
 };
 
-thread_local ThreadCache tls_cache;
+#if defined(_WIN32)
+static DWORD tls_key = TLS_OUT_OF_INDEXES;
+extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason,
+                               LPVOID lpvReserved);
+#else
+static pthread_key_t tls_key;
+static pthread_once_t key_once = PTHREAD_ONCE_INIT;
+static void make_key();
+#endif
+
+inline ThreadCache &get_thread_cache() {
+#if defined(_WIN32)
+  ThreadCache *cache = static_cast<ThreadCache *>(TlsGetValue(tls_key));
+  if (!cache && tls_key != TLS_OUT_OF_INDEXES) {
+    cache = new ThreadCache();
+    cache->drained.store(false);
+    TlsSetValue(tls_key, cache);
+  }
+
+  static ThreadCache fallback_cache;
+  return cache ? *cache : fallback_cache;
+#else
+  pthread_once(&key_once, make_key);
+  ThreadCache *cache = static_cast<ThreadCache *>(pthread_getspecific(tls_key));
+  if (!cache) {
+    cache = new ThreadCache();
+    cache->drained.store(false);
+    pthread_setspecific(tls_key, cache);
+  }
+  return *cache;
+#endif
+}
 
 class MemAllocator {
   struct PoolEntry {
@@ -307,14 +341,14 @@ public:
     if (size <= MAX_FIXED_SIZE) {
       size_t id = get_pool_id(size);
 
-      if (auto *h = tls_cache.local[id].pop()) {
+      if (auto *h = get_thread_cache().local[id].pop()) {
         h->ref_count.store(1, std::memory_order_relaxed);
         return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
       }
 
       refill_tls(id);
 
-      if (auto *h = tls_cache.local[id].pop()) {
+      if (auto *h = get_thread_cache().local[id].pop()) {
         h->ref_count.store(1, std::memory_order_relaxed);
         return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
       }
@@ -334,16 +368,42 @@ public:
 
     if (h->validate() && !h->meta.is_large) {
       size_t id = h->meta.pool_id;
-      tls_cache.local[id].push(h);
+      get_thread_cache().local[id].push(h);
       return;
     }
 
     free_large(ptr);
   }
 
+  static void drain_thread_cache(ThreadCache *cache) {
+    if (!cache)
+      return;
+
+    bool expected = false;
+    if (!cache->drained.compare_exchange_strong(expected, true)) {
+      return;
+    }
+
+    MemAllocator &alloc = instance();
+    for (size_t id = 0; id < MAX_POOL_COUNT; ++id) {
+      BlockHeader *h;
+      while ((h = cache->local[id].pop()) != nullptr) {
+        if (alloc.pools_[id].pool) {
+          alloc.pools_[id].pool->return_header(h);
+        }
+      }
+    }
+    delete cache;
+  }
+
 private:
   MemAllocator() : page_size_(get_page_size()) {
     pools_.resize(MAX_POOL_COUNT);
+#if defined(_WIN32)
+    if (tls_key == TLS_OUT_OF_INDEXES) {
+      tls_key = TlsAlloc();
+    }
+#endif
   }
 
   void refill_tls(size_t id) {
@@ -354,7 +414,7 @@ private:
 
     for (size_t i = 0; i < ThreadCache::REFILL_BATCH; ++i) {
       if (auto *h = e.pool->allocate_header()) {
-        tls_cache.local[id].push(h);
+        get_thread_cache().local[id].push(h);
       } else {
         break;
       }
@@ -407,5 +467,52 @@ private:
       platform_free_aligned(h->base);
   }
 };
+
+#if defined(_WIN32)
+extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason,
+                               LPVOID lpvReserved) {
+  switch (fdwReason) {
+  case DLL_PROCESS_ATTACH: {
+    tls_key = TlsAlloc();
+    if (tls_key == TLS_OUT_OF_INDEXES) {
+      return FALSE;
+    }
+    break;
+  }
+  case DLL_THREAD_ATTACH: {
+    ThreadCache *cache = new ThreadCache();
+    TlsSetValue(tls_key, cache);
+    break;
+  }
+  case DLL_THREAD_DETACH: {
+    ThreadCache *cache = static_cast<ThreadCache *>(TlsGetValue(tls_key));
+    MemAllocator::drain_thread_cache(cache);
+    TlsSetValue(tls_key, nullptr);
+    break;
+  }
+  case DLL_PROCESS_DETACH: {
+    if (tls_key != TLS_OUT_OF_INDEXES) {
+      TlsFree(tls_key);
+      tls_key = TLS_OUT_OF_INDEXES;
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  return TRUE;
+}
+#else
+
+static void make_key() {
+  pthread_key_create(&tls_key, [](void *ptr) {
+    ThreadCache *cache = static_cast<ThreadCache *>(ptr);
+    if (!cache)
+      return;
+
+    MemAllocator::drain_thread_cache(cache);
+  });
+}
+#endif
 
 } // namespace mempool
