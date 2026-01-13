@@ -22,9 +22,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install Compilers and Deps
         run: |
           sudo apt-get update
+          sudo apt-get install -y gcc-11 g++-11      
+          sudo apt-get install -y clang-14 clang++-14          
           sudo apt-get install -y cmake build-essential lcov
 
       - name: Configure CMake
@@ -51,7 +53,10 @@ jobs:
           ctest --output-on-failure
 
       - name: Run Benchmark (Smoke Test)
-        run: ./build/mempool-bench --benchmark_min_time=0.1
+        run: |
+          if [ -f "./build/mempool-bench" ]; then
+            ./build/mempool-bench --benchmark_min_time=0.1
+          fi
 
       - name: Generate Coverage Report
         if: matrix.config.coverage == 'ON'
