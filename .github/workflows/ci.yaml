@@ -14,9 +14,8 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { name: "GCC 11 Release", cc: "gcc-11", cxx: "g++-11", build_type: "Release", coverage: "OFF" }
-          - { name: "Clang 14 Debug ASan", cc: "clang-14", cxx: "clang++-14", build_type: "Debug", coverage: "OFF" }
-          - { name: "GCC 11 Coverage", cc: "gcc-11", cxx: "g++-11", build_type: "Debug", coverage: "ON" }
+          - { name: "GCC 11 Release", cc: "gcc-11", cxx: "g++-11", build_type: "Release" }
+          - { name: "Clang 14 Debug ASan", cc: "clang-14", cxx: "clang++-14", build_type: "Debug" }
 
     steps:
       - name: Checkout code
@@ -25,8 +24,7 @@ jobs:
       - name: Install Compilers and Deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-11 g++-11 clang-14 clang++-14
-          sudo apt-get install -y cmake build-essential lcov
+          sudo apt-get install -y gcc-11 g++-11 clang-14 clang++-14 cmake build-essential
 
       - name: Configure CMake
         run: |
@@ -40,8 +38,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }} \
             -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }} \
             -DMEMPOOL_BUILD_TESTS=ON \
-            -DMEMPOOL_BUILD_BENCHMARK=ON \
-            -DMEMPOOL_ENABLE_COVERAGE=${{ matrix.config.coverage }}
+            -DMEMPOOL_BUILD_BENCHMARK=ON
 
       - name: Build
         run: cmake --build build -j $(nproc)
@@ -56,22 +53,3 @@ jobs:
           if [ -f "./build/mempool-bench" ]; then
             ./build/mempool-bench --benchmark_min_time=0.1
           fi
-
-      - name: Generate Coverage Report
-        if: matrix.config.coverage == 'ON'
-        run: |
-          lcov --directory . \
-               --capture \
-               --gcov-tool /usr/bin/gcov-11 \
-               --output-file coverage.info
-          
-          lcov --remove coverage.info '/usr/*' '*/_deps/*' '*/tests/*' --output-file coverage.info
-          
-          lcov --list coverage.info
-
-      - name: Upload Coverage to Codecov
-        if: matrix.config.coverage == 'ON'
-        uses: codecov/codecov-action@v3
-        with:
-          files: coverage.info
-          fail_ci_if_error: false
