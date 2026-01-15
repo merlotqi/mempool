@@ -338,25 +338,25 @@ public:
   }
 
   void *allocate(size_t size, size_t align) {
-    if (size <= MAX_FIXED_SIZE) {
-      size_t id = get_pool_id(size);
-
-      if (auto *h = get_thread_cache().local[id].pop()) {
-        h->ref_count.store(1, std::memory_order_relaxed);
-        return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
-      }
-
-      refill_tls(id);
-
-      if (auto *h = get_thread_cache().local[id].pop()) {
-        h->ref_count.store(1, std::memory_order_relaxed);
-        return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
-      }
-
-      return nullptr;
+    if (size > MAX_FIXED_SIZE || align > ALIGN_SIZE) {
+      return alloc_large(size, align);
     }
 
-    return alloc_large(size, align);
+    size_t id = get_pool_id(size);
+
+    if (auto *h = get_thread_cache().local[id].pop()) {
+      h->ref_count.store(1, std::memory_order_relaxed);
+      return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
+    }
+
+    refill_tls(id);
+
+    if (auto *h = get_thread_cache().local[id].pop()) {
+      h->ref_count.store(1, std::memory_order_relaxed);
+      return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
+    }
+
+    return nullptr;
   }
 
   void deallocate(void *ptr) {
