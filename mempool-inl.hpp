@@ -155,9 +155,7 @@ struct BlockHeader {
     uint32_t size : 25;
   } meta;
 
-  std::atomic<uint32_t> ref_count;
-
-  BlockHeader() : next_free(nullptr), ref_count(1) {
+  BlockHeader() : next_free(nullptr) {
     meta.magic = MAGIC_NUMBER;
     meta.pool_id = 0;
     meta.is_large = 0;
@@ -219,8 +217,19 @@ class alignas(CACHE_LINE_SIZE) BlockPool {
 
 public:
   explicit BlockPool(size_t sz) : block_size_(align_up(sz, ALIGN_SIZE)) {
-    blocks_per_chunk_ =
-        DEFAULT_CHUNK_SIZE / (block_size_ + sizeof(BlockHeader));
+    // Dynamic chunk size based on block size for better memory utilization
+    size_t chunk_size = DEFAULT_CHUNK_SIZE;
+    if (block_size_ <= 64) {
+      chunk_size = 32 * 1024;  // 32KB for small blocks
+    } else if (block_size_ <= 256) {
+      chunk_size = 64 * 1024;  // 64KB for medium blocks
+    } else if (block_size_ <= 1024) {
+      chunk_size = 128 * 1024; // 128KB for large blocks
+    } else {
+      chunk_size = 256 * 1024; // 256KB for very large blocks
+    }
+
+    blocks_per_chunk_ = chunk_size / (block_size_ + sizeof(BlockHeader));
     if (blocks_per_chunk_ < 4)
       blocks_per_chunk_ = 4;
   }
@@ -279,7 +288,7 @@ private:
 // ChunkHeader is cache-line aligned to avoid false sharing
 // during global refill/drain paths (cold but contended).
 struct ThreadCache {
-  static constexpr size_t REFILL_BATCH = 32;
+  static constexpr size_t REFILL_BATCH = 64;
   FreeList local[MAX_POOL_COUNT];
 
   std::atomic<bool> drained{false};
@@ -345,14 +354,12 @@ public:
     size_t id = get_pool_id(size);
 
     if (auto *h = get_thread_cache().local[id].pop()) {
-      h->ref_count.store(1, std::memory_order_relaxed);
       return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
     }
 
     refill_tls(id);
 
     if (auto *h = get_thread_cache().local[id].pop()) {
-      h->ref_count.store(1, std::memory_order_relaxed);
       return reinterpret_cast<uint8_t *>(h) + sizeof(BlockHeader);
     }
 

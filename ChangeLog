@@ -1,5 +1,10 @@
+Date: 2026-01-21
+Commit: 5beedf6
+Author: Merlot.Qi <merlotrain.mc@gmail.com>
+Message: feat: enhance benchmarks, tests, and memory pool performance
+
 Date: 2026-01-15
-Commit: ed9de62
+Commit: 017dfd0
 Author: Merlot.Qi <merlotrain.mc@gmail.com>
 Message: Add basic and concurrency test, fix gtest framework error， fix cmake config error.
 

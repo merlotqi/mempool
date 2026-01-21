@@ -65,10 +65,30 @@ if(MEMPOOL_BUILD_BENCHMARK)
     add_executable(mempool_bench benchmark/bench_main.cpp)
     target_link_libraries(mempool_bench PRIVATE mempool benchmark::benchmark)
     set_target_properties(mempool_bench PROPERTIES OUTPUT_NAME "mempool-bench")
-    
+
+    add_executable(mempool_bench_random benchmark/bench_random.cpp)
+    target_link_libraries(mempool_bench_random PRIVATE mempool benchmark::benchmark)
+    set_target_properties(mempool_bench_random PROPERTIES OUTPUT_NAME "mempool-bench-random")
+
+    add_executable(mempool_bench_lifecycle benchmark/bench_long_lifecycle.cpp)
+    target_link_libraries(mempool_bench_lifecycle PRIVATE mempool benchmark::benchmark)
+    set_target_properties(mempool_bench_lifecycle PROPERTIES OUTPUT_NAME "mempool-bench-lifecycle")
+
     add_custom_target(run_benchmark
         COMMAND $<TARGET_FILE:mempool_bench>
         COMMENT "Running memory pool benchmarks"
+        VERBATIM
+    )
+
+    add_custom_target(run_benchmark_random
+        COMMAND $<TARGET_FILE:mempool_bench_random>
+        COMMENT "Running random allocation benchmarks"
+        VERBATIM
+    )
+
+    add_custom_target(run_benchmark_lifecycle
+        COMMAND $<TARGET_FILE:mempool_bench_lifecycle>
+        COMMENT "Running lifecycle benchmarks"
         VERBATIM
     )
 endif()
@@ -93,7 +113,13 @@ if(MEMPOOL_BUILD_TESTS)
     enable_testing()
     include(GoogleTest)
 
-    set(TEST_MODULES "tests/test_basic.cpp" "tests/test_concurrency.cpp")
+    set(TEST_MODULES
+        "tests/test_basic.cpp"
+        "tests/test_concurrency.cpp"
+        "tests/test_edge_cases.cpp"
+        "tests/test_memory_leak.cpp"
+        "tests/test_performance_regression.cpp"
+    )
     
     foreach(TEST_SOURCE ${TEST_MODULES})
         get_filename_component(TEST_NAME ${TEST_SOURCE} NAME_WE)
